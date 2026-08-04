@@ -1,6 +1,6 @@
 # stop-servers.ps1
 # 사용법: .\stop-servers.ps1
-# 역순으로 종료: GameAgent → LobbyServer → DummySubServer → MasterServer → Docker
+# 역순으로 종료: ChatServer → GameAgent → LobbyServer → DummySubServer → MasterServer → Docker
 
 $devTools = "C:\Users\rlawh\Desktop\Main\AutoBattleDevTools"
 $pidFile = "$devTools\server-pids.json"
@@ -13,7 +13,7 @@ if (-not (Test-Path $pidFile)) {
 $savedPids = Get-Content $pidFile | ConvertFrom-Json
 
 # 역순 종료 순서
-$stopOrder = @("GameAgent", "LobbyServer", "DummySubServer", "MasterServer")
+$stopOrder = @("ChatServer", "GameAgent", "LobbyServer", "DummySubServer", "MasterServer")
 
 foreach ($name in $stopOrder) {
     $savedPid = $savedPids.$name

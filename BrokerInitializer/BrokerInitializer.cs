@@ -1,11 +1,12 @@
 using Confluent.Kafka;
 using Confluent.Kafka.Admin;
 using RabbitMQ.Client;
+using StackExchange.Redis;
 
 namespace BrokerInitializer;
 
 /// <summary>
-/// Kafka 토픽과 RabbitMQ 큐/exchange를 초기화하는 도구.
+/// Kafka 토픽, RabbitMQ 큐/exchange, Redis를 초기화하는 도구.
 /// 테스트 전 브로커 상태를 깨끗하게 리셋하는 용도로 쓴다.
 ///
 /// 주의: 이 도구는 기존 토픽/큐를 삭제하고 재생성한다.
@@ -16,6 +17,7 @@ public sealed class BrokerInitializer
 {
     private Action<KafkaConfig>? _kafkaSetup;
     private Action<RabbitMqConfig>? _rabbitSetup;
+    private string? _redisConnectionString;
 
     private BrokerInitializer() { }
 
@@ -36,7 +38,14 @@ public sealed class BrokerInitializer
         return this;
     }
 
-    /// <summary>설정에 따라 Kafka와 RabbitMQ를 초기화한다.</summary>
+    /// <summary>Redis 연결 문자열을 설정한다. 설정 시 FLUSHDB로 초기화한다.</summary>
+    public BrokerInitializer Redis(string connectionString)
+    {
+        _redisConnectionString = connectionString;
+        return this;
+    }
+
+    /// <summary>설정에 따라 Kafka, RabbitMQ, Redis를 초기화한다.</summary>
     public async Task RunAsync()
     {
         Console.WriteLine("=== BrokerInitializer 시작 ===");
@@ -56,6 +65,11 @@ public sealed class BrokerInitializer
             InitRabbitMq(config);
         }
 
+        if (_redisConnectionString is not null)
+        {
+            await InitRedisAsync(_redisConnectionString);
+        }
+
         Console.WriteLine();
         Console.WriteLine("=== 초기화 완료 ===");
     }
@@ -67,11 +81,9 @@ public sealed class BrokerInitializer
         var adminConfig = new AdminClientConfig { BootstrapServers = config.BootstrapServers };
         using var admin = new AdminClientBuilder(adminConfig).Build();
 
-        // 기존 토픽 목록 조회
         var metadata = admin.GetMetadata(TimeSpan.FromSeconds(10));
         var existingTopics = metadata.Topics.Select(t => t.Topic).ToHashSet();
 
-        // 이미 있는 토픽 삭제
         var toDelete = config.Topics
             .Select(t => t.Name)
             .Where(existingTopics.Contains)
@@ -81,11 +93,9 @@ public sealed class BrokerInitializer
         {
             Console.WriteLine($"[Kafka] 기존 토픽 삭제: {string.Join(", ", toDelete)}");
             await admin.DeleteTopicsAsync(toDelete);
-            // 삭제 후 브로커가 반영할 시간을 잠깐 준다
             await Task.Delay(TimeSpan.FromSeconds(2));
         }
 
-        // 토픽 생성
         if (config.Topics.Count > 0)
         {
             var specs = config.Topics.Select(t => new TopicSpecification
@@ -120,25 +130,20 @@ public sealed class BrokerInitializer
         using var connection = factory.CreateConnection();
         using var channel = connection.CreateModel();
 
-        // fanout exchange 삭제 후 재생성
         foreach (var fanout in config.Fanouts)
         {
-            // 바인딩된 큐 먼저 삭제
             foreach (var queueName in fanout.BoundQueues)
             {
                 channel.QueueDelete(queueName, ifUnused: false, ifEmpty: false);
                 Console.WriteLine($"[RabbitMQ] 큐 삭제: {queueName}");
             }
 
-            // exchange 삭제
             channel.ExchangeDelete(fanout.ExchangeName, ifUnused: false);
             Console.WriteLine($"[RabbitMQ] Exchange 삭제: {fanout.ExchangeName}");
 
-            // exchange 재생성
             channel.ExchangeDeclare(fanout.ExchangeName, ExchangeType.Fanout, durable: true);
             Console.WriteLine($"[RabbitMQ] Fanout exchange 생성: {fanout.ExchangeName}");
 
-            // 큐 재생성 + 바인딩
             foreach (var queueName in fanout.BoundQueues)
             {
                 channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false);
@@ -147,7 +152,6 @@ public sealed class BrokerInitializer
             }
         }
 
-        // work queue 패턴 큐 삭제 후 재생성
         foreach (var queue in config.Queues)
         {
             channel.QueueDelete(queue.Name, ifUnused: false, ifEmpty: false);
@@ -156,5 +160,16 @@ public sealed class BrokerInitializer
             channel.QueueDeclare(queue.Name, durable: true, exclusive: false, autoDelete: false);
             Console.WriteLine($"[RabbitMQ] 큐 생성: {queue.Name}");
         }
+    }
+
+    private static async Task InitRedisAsync(string connectionString)
+    {
+        Console.WriteLine($"[Redis] {connectionString} 연결 중...");
+
+        using var redis = await ConnectionMultiplexer.ConnectAsync(connectionString);
+        var db = redis.GetDatabase();
+        await db.ExecuteAsync("FLUSHDB");
+
+        Console.WriteLine("[Redis] FLUSHDB 완료 - 모든 세션 데이터 초기화됨");
     }
 }

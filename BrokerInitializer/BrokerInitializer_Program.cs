@@ -26,4 +26,5 @@ await BrokerInitializer.BrokerInitializer.Create()
         .AddFanout(                                 // 운영 공지 브로드캐스트
             exchangeName: "ops-announcements",
             boundQueues: ["lobby-fan", "ingame-fan"]))
+    .Redis("localhost:6379")                        // 세션 데이터 초기화
     .RunAsync();

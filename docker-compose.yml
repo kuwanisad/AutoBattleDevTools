@@ -22,3 +22,10 @@ services:
     ports:
       - "5672:5672"    # AMQP (실제 메시지 통신)
       - "15672:15672"  # 관리 콘솔 (http://localhost:15672, guest/guest)
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"    # Redis 기본 포트
+    command: redis-server --save "" --appendonly no  # 개발 환경 - 영속성 비활성화
