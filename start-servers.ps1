@@ -1,14 +1,13 @@
 # start-servers.ps1
 # 사용법: .\start-servers.ps1
-# 순서: Docker → BrokerInitializer → MasterServer → DummySubServer → LobbyServer → GameAgent → ChatServer
+# 순서: Docker → BrokerInitializer → MasterServer → MatchingServer → DummySubServer → LobbyServer → GameAgent → ChatServer
 # GameAgent 실행 후 Unity 에디터에서 수동으로 Play 버튼을 눌러야 한다.
 
-$root = "C:\Users\rlawh\Desktop\Main"
-$gameServer = "$root\AutoBattlerServer\GameServer"
-$devTools = "$root\AutoBattleDevTools"
+$devTools = $PSScriptRoot
+$root = Split-Path $devTools -Parent
+$gameServer = "$root\Server\GameServer"
 $pidFile = "$devTools\server-pids.json"
 
-# 이전 서버가 아직 살아있는지 확인
 if (Test-Path $pidFile) {
     $savedPids = Get-Content $pidFile | ConvertFrom-Json
     $aliveCount = 0
@@ -27,12 +26,11 @@ if (Test-Path $pidFile) {
         exit 1
     }
 
-    # 모두 종료됐으면 PID 파일 삭제
     Remove-Item $pidFile
 }
 
 # 0. Docker 컨테이너 시작
-Write-Host "=== [0/6] Docker 컨테이너 시작 ===" -ForegroundColor Cyan
+Write-Host "=== [0/8] Docker 컨테이너 시작 ===" -ForegroundColor Cyan
 docker-compose -f "$devTools\docker-compose.yml" up -d
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Docker 시작 실패. 중단합니다." -ForegroundColor Red
@@ -40,8 +38,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 Start-Sleep -Seconds 5
 
-# 1. BrokerInitializer - 토픽/큐 초기화 (완료될 때까지 기다림)
-Write-Host "=== [1/6] BrokerInitializer 실행 ===" -ForegroundColor Cyan
+# 1. BrokerInitializer
+Write-Host "=== [1/8] BrokerInitializer 실행 ===" -ForegroundColor Cyan
 Push-Location "$devTools\BrokerInitializer"
 dotnet run
 Pop-Location
@@ -51,40 +49,44 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# PID 저장용 해시테이블
 $serverPids = @{}
 
 # 2. MasterServer
-Write-Host "=== [2/6] MasterServer 실행 ===" -ForegroundColor Cyan
+Write-Host "=== [2/8] MasterServer 실행 ===" -ForegroundColor Cyan
 $p = Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$gameServer\MasterServer'; dotnet run" -PassThru
 $serverPids["MasterServer"] = $p.Id
 Start-Sleep -Seconds 3
 
-# 3. DummySubServer
-Write-Host "=== [3/6] DummySubServer 실행 ===" -ForegroundColor Cyan
+# 3. MatchingServer (마스터 서버 직후 실행 - 마스터가 주소를 메인 서버들에 전달)
+Write-Host "=== [3/8] MatchingServer 실행 ===" -ForegroundColor Cyan
+$p = Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$gameServer\MatchingServer'; dotnet run" -PassThru
+$serverPids["MatchingServer"] = $p.Id
+Start-Sleep -Seconds 3
+
+# 4. DummySubServer
+Write-Host "=== [4/8] DummySubServer 실행 ===" -ForegroundColor Cyan
 $p = Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$gameServer\DummySubServer'; dotnet run" -PassThru
 $serverPids["DummySubServer"] = $p.Id
 Start-Sleep -Seconds 3
 
-# 4. LobbyServer
-Write-Host "=== [4/6] LobbyServer 실행 ===" -ForegroundColor Cyan
+# 5. LobbyServer
+Write-Host "=== [5/8] LobbyServer 실행 ===" -ForegroundColor Cyan
 $p = Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$gameServer\LobbyServer'; dotnet run" -PassThru
 $serverPids["LobbyServer"] = $p.Id
 Start-Sleep -Seconds 3
 
-# 5. GameAgent
-Write-Host "=== [5/6] GameAgent 실행 ===" -ForegroundColor Cyan
+# 6. GameAgent
+Write-Host "=== [6/8] GameAgent 실행 ===" -ForegroundColor Cyan
 $p = Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$gameServer\GameAgent'; dotnet run" -PassThru
 $serverPids["GameAgent"] = $p.Id
 Start-Sleep -Seconds 3
 
-# 6. ChatServer
-Write-Host "=== [6/6] ChatServer 실행 ===" -ForegroundColor Cyan
+# 7. ChatServer
+Write-Host "=== [7/8] ChatServer 실행 ===" -ForegroundColor Cyan
 $p = Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$gameServer\ChatServer'; dotnet run" -PassThru
 $serverPids["ChatServer"] = $p.Id
 Start-Sleep -Seconds 3
 
-# PID 파일 저장
 $serverPids | ConvertTo-Json | Set-Content $pidFile
 Write-Host ""
 Write-Host "=== 모든 서버 실행 완료 ===" -ForegroundColor Green

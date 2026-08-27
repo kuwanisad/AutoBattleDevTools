@@ -1,8 +1,8 @@
 # stop-servers.ps1
 # 사용법: .\stop-servers.ps1
-# 역순으로 종료: ChatServer → GameAgent → LobbyServer → DummySubServer → MasterServer → Docker
+# 역순으로 종료: ChatServer → GameAgent → LobbyServer → DummySubServer → MatchingServer → MasterServer → Docker
 
-$devTools = "C:\Users\rlawh\Desktop\Main\AutoBattleDevTools"
+$devTools = $PSScriptRoot
 $pidFile = "$devTools\server-pids.json"
 
 if (-not (Test-Path $pidFile)) {
@@ -12,8 +12,7 @@ if (-not (Test-Path $pidFile)) {
 
 $savedPids = Get-Content $pidFile | ConvertFrom-Json
 
-# 역순 종료 순서
-$stopOrder = @("ChatServer", "GameAgent", "LobbyServer", "DummySubServer", "MasterServer")
+$stopOrder = @("ChatServer", "GameAgent", "LobbyServer", "DummySubServer", "MatchingServer", "MasterServer")
 
 foreach ($name in $stopOrder) {
     $savedPid = $savedPids.$name
@@ -26,10 +25,8 @@ foreach ($name in $stopOrder) {
     }
 
     Write-Host "$name 종료 중 (PID=$savedPid)..." -ForegroundColor Cyan
-    # taskkill /T: 자식 프로세스(dotnet run이 띄운 실제 서버)까지 같이 종료
     taskkill /PID $savedPid /T /F | Out-Null
 
-    # 프로세스가 완전히 종료될 때까지 대기 (최대 10초)
     try {
         Wait-Process -Id $savedPid -Timeout 10 -ErrorAction SilentlyContinue
         Write-Host "$name 종료 완료" -ForegroundColor Green
@@ -40,11 +37,9 @@ foreach ($name in $stopOrder) {
     Start-Sleep -Seconds 1
 }
 
-# PID 파일 삭제
 Remove-Item $pidFile
 Write-Host ""
 
-# Docker 종료
 Write-Host "=== Docker 컨테이너 종료 ===" -ForegroundColor Cyan
 docker-compose -f "$devTools\docker-compose.yml" down
 Write-Host ""

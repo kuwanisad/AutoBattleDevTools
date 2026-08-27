@@ -1,0 +1,10 @@
+파워셀에서
+Unblock-File "(경로)\start-servers.ps1"
+Unblock-File "(경로)\stop-servers.ps1"
+
+
+
+
+Unblock-File "C:\Users\rlawh\Desktop\Main\GameProject1\DevTools\start-servers.ps1"
+Unblock-File "C:\Users\rlawh\Desktop\Main\GameProject1\DevTools\stop-servers.ps1"
+
