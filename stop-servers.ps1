@@ -1,6 +1,7 @@
 # stop-servers.ps1
 # 사용법: .\stop-servers.ps1
-# 역순으로 종료: ChatServer → GameAgent → LobbyServer → DummySubServer → MatchingServer → MasterServer → Docker
+# 역순으로 종료: ChatServer → GameAgent → LobbyServer → DummySubServer → LoginServer →
+#              AccountServer → MatchingServer → MasterServer → Docker
 
 $devTools = $PSScriptRoot
 $pidFile = "$devTools\server-pids.json"
@@ -12,7 +13,7 @@ if (-not (Test-Path $pidFile)) {
 
 $savedPids = Get-Content $pidFile | ConvertFrom-Json
 
-$stopOrder = @("ChatServer", "GameAgent", "LobbyServer", "DummySubServer", "MatchingServer", "MasterServer")
+$stopOrder = @("ChatServer", "GameAgent", "LobbyServer", "DummySubServer", "LoginServer", "AccountServer", "MatchingServer", "MasterServer")
 
 foreach ($name in $stopOrder) {
     $savedPid = $savedPids.$name
