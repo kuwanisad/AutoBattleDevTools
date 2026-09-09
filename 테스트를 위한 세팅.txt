@@ -1,0 +1,1 @@
+chat_test_account_a.txt, chat_test_account_b.txt를 바탕화면으로 옮겨야 함
