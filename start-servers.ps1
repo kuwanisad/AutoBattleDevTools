@@ -6,21 +6,144 @@
 # 순서: Docker → BrokerInitializer → MasterServer → MatchingServer → AccountServer →
 #       LoginServer → DummySubServer → LobbyServer → GameAgent → ChatServer
 # GameAgent 실행 후 Unity 에디터에서 수동으로 Play 버튼을 눌러야 한다.
+#
+# 하네스 모드(TestHarness가 호출할 때 - 사람이 써도 됨):
+#   .\start-servers.ps1 -LogDir <폴더> [-SkipDocker] [-Only LoginServer,LobbyServer] [-ReadyTimeoutSeconds 60]
+#   -LogDir      창을 띄우지 않고 각 서버의 콘솔 출력을 <폴더>\<서버>.log(.err.log)로 받는다.
+#                로그는 JSON 한 줄 형식(시각 UTC 포함). PID 파일도 <폴더>\server-pids.json에 둔다.
+#                고정 대기 대신 서버가 "Application started"를 찍을 때까지 기다리고, 제한 시간 안에
+#                안 뜨거나 뜨다가 죽으면 로그 끝부분을 보여주고 exit 1.
+#   -SkipDocker  Docker 컨테이너 시작과 BrokerInitializer를 건너뛴다(이미 떠 있고 초기화돼 있을 때).
+#   -Only        지정한 서버만 띄운다(순서는 항상 위 순서를 따름). 수동 모드에서도 쓸 수 있다.
+#   -HarnessAddress <주소>  각 서버가 테스트 하네스 제어 서버(예: http://localhost:9000)에 접속하게 한다
+#                (서버 이름이 하네스에서 부르는 이름이 됨). -LogDir과 같이 써야 한다.
+#   종료: .\stop-servers.ps1 -LogDir <같은 폴더>
+# 성공하면 exit 0, 실패하면 exit 1.
 
 param(
     [switch]$Build,
-    [string]$Configuration = "Debug"
+    [string]$Configuration = "Debug",
+    [string]$LogDir,
+    [switch]$SkipDocker,
+    # ValidateSet을 안 쓰고 아래에서 직접 검사한다 - powershell -File로 부르면
+    # "-Only A,B"가 배열이 아니라 "A,B" 문자열 하나로 들어오기 때문(TestHarness는 -File로 부름).
+    [string[]]$Only,
+    [int]$ReadyTimeoutSeconds = 60,
+    [string]$HarnessAddress
 )
+
+. "$PSScriptRoot\server-common.ps1"
 
 $devTools = $PSScriptRoot
 $root = Split-Path $devTools -Parent
 $gameServer = "$root\Server\GameServer"
-$pidFile = "$devTools\server-pids.json"
+$harness = [bool]$LogDir
 
-# 이미 빌드된 DLL을 dotnet 호스트로 바로 실행한다(빌드 확인 자체를 안 거침, dotnet run보다
-# 훨씬 빠름). -Build가 지정되면 예전 방식(dotnet run - 매번 최신 상태 확인 + 필요시 빌드)으로
-# 되돌아간다. 둘 다 새 PowerShell 창에서 Start-Process로 띄우는 건 동일.
-function Start-ServerProcess {
+if ($HarnessAddress -and -not $harness) {
+    Write-Host "-HarnessAddress는 -LogDir(하네스 모드)와 같이 써야 합니다." -ForegroundColor Red
+    exit 1
+}
+
+if ($Only) {
+    $Only = @($Only | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $unknown = @($Only | Where-Object { $ServerOrder -notcontains $_ })
+    if ($unknown.Count -gt 0) {
+        Write-Host "-Only에 모르는 서버 이름: $($unknown -join ', ')" -ForegroundColor Red
+        Write-Host "가능한 이름: $($ServerOrder -join ', ')" -ForegroundColor Red
+        exit 1
+    }
+}
+
+if ($harness) {
+    $LogDir = Resolve-LogDir $LogDir
+    # dotnet run은 빌드 시간까지 포함되므로 제한 시간을 따로 안 줬으면 넉넉히.
+    if ($Build -and -not $PSBoundParameters.ContainsKey("ReadyTimeoutSeconds")) { $ReadyTimeoutSeconds = 300 }
+}
+$pidFile = Get-PidFilePath -DevTools $devTools -LogDir $LogDir
+
+# 이미 떠 있는 서버가 있으면 중단 - 이번에 쓸 PID 파일과, (하네스 모드라면) 수동 모드 PID
+# 파일도 확인한다. 같은 포트를 쓰므로 어느 쪽이든 떠 있으면 새로 띄운 서버가 죽는다.
+$pidFilesToCheck = @($pidFile)
+if ($harness) { $pidFilesToCheck += Get-PidFilePath -DevTools $devTools }
+
+$aliveCount = 0
+foreach ($file in $pidFilesToCheck) {
+    if (-not (Test-Path $file)) { continue }
+
+    $savedPids = Read-PidFile $file
+    $fileAlive = 0
+    foreach ($name in $savedPids.Keys) {
+        $savedPid = $savedPids[$name]
+        if (Get-Process -Id $savedPid -ErrorAction SilentlyContinue) {
+            Write-Host "서버가 아직 실행 중입니다: $name (PID=$savedPid, $file)" -ForegroundColor Red
+            $fileAlive++
+        }
+    }
+
+    $aliveCount += $fileAlive
+    if ($fileAlive -eq 0 -and $file -eq $pidFile) { Remove-Item $file }
+}
+
+if ($aliveCount -gt 0) {
+    Write-Host ""
+    Write-Host "실행 중인 서버가 있습니다. stop-servers.ps1을 먼저 실행하세요." -ForegroundColor Red
+    exit 1
+}
+
+# 이번에 띄울 서버 - 순서는 항상 $ServerOrder를 따른다.
+$targets = if ($Only) { $ServerOrder | Where-Object { $Only -contains $_ } } else { $ServerOrder }
+
+$totalSteps = $ServerOrder.Count + 2   # Docker + BrokerInitializer + 서버들
+
+if ($SkipDocker) {
+    Write-Host "=== [0-1/$totalSteps] Docker / BrokerInitializer 건너뜀 (-SkipDocker) ===" -ForegroundColor DarkGray
+}
+else {
+    # 0. Docker 컨테이너 시작
+    Write-Host "=== [0/$totalSteps] Docker 컨테이너 시작 ===" -ForegroundColor Cyan
+    docker-compose -f "$devTools\docker-compose.yml" up -d
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Docker 시작 실패. 중단합니다." -ForegroundColor Red
+        exit 1
+    }
+    Start-Sleep -Seconds 5
+
+    # 1. BrokerInitializer (콘솔 앱이라 완료를 기다려야 하므로 동기 실행)
+    Write-Host "=== [1/$totalSteps] BrokerInitializer 실행 ===" -ForegroundColor Cyan
+    $brokerDir = "$devTools\BrokerInitializer"
+    $brokerDll = "$brokerDir\bin\$Configuration\net8.0\BrokerInitializer.dll"
+
+    if (-not $Build -and -not (Test-Path $brokerDll)) {
+        Write-Host "빌드된 DLL을 못 찾음: $brokerDll" -ForegroundColor Red
+        Write-Host "먼저 빌드하거나(dotnet build), .\start-servers.ps1 -Build 로 실행하세요." -ForegroundColor Red
+        exit 1
+    }
+
+    if ($harness) {
+        $brokerArgs = if ($Build) { @("run") } else { @("`"$brokerDll`"") }
+        $broker = Start-HarnessProcess -Name "BrokerInitializer" -WorkingDirectory $brokerDir `
+            -DotnetArguments $brokerArgs -LogDir $LogDir -Wait
+        $exitCode = $broker.Process.ExitCode
+        if ($exitCode -ne 0) {
+            Write-LogTail $broker.LogPath
+            Write-LogHead $broker.ErrPath
+        }
+    }
+    else {
+        Push-Location $brokerDir
+        if ($Build) { dotnet run } else { dotnet $brokerDll }
+        $exitCode = $LASTEXITCODE
+        Pop-Location
+    }
+
+    if ($exitCode -ne 0) {
+        Write-Host "BrokerInitializer 실패. 중단합니다." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# 수동 모드: 예전과 같이 서버마다 새 PowerShell 창을 띄운다.
+function Start-WindowedServer {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
         [Parameter(Mandatory)][string]$ProjectName
@@ -39,121 +162,61 @@ function Start-ServerProcess {
     if (-not (Test-Path $dll)) {
         Write-Host "빌드된 DLL을 못 찾음: $dll" -ForegroundColor Red
         Write-Host "먼저 빌드하거나(dotnet build), .\start-servers.ps1 -Build 로 실행하세요." -ForegroundColor Red
-        exit 1
+        return $null
     }
 
     return Start-Process powershell -ArgumentList "-NoExit", "-Command", "$titleCommand; cd '$ProjectPath'; dotnet '$dll'" -PassThru
 }
 
-if (Test-Path $pidFile) {
-    $savedPids = Get-Content $pidFile | ConvertFrom-Json
-    $aliveCount = 0
-
-    foreach ($entry in $savedPids.PSObject.Properties) {
-        $savedPid = $entry.Value
-        if (Get-Process -Id $savedPid -ErrorAction SilentlyContinue) {
-            Write-Host "서버가 아직 실행 중입니다: $($entry.Name) (PID=$savedPid)" -ForegroundColor Red
-            $aliveCount++
-        }
-    }
-
-    if ($aliveCount -gt 0) {
-        Write-Host ""
-        Write-Host "실행 중인 서버가 있습니다. stop-servers.ps1을 먼저 실행하세요." -ForegroundColor Red
-        exit 1
-    }
-
-    Remove-Item $pidFile
-}
-
-# 0. Docker 컨테이너 시작
-Write-Host "=== [0/10] Docker 컨테이너 시작 ===" -ForegroundColor Cyan
-docker-compose -f "$devTools\docker-compose.yml" up -d
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Docker 시작 실패. 중단합니다." -ForegroundColor Red
-    exit 1
-}
-Start-Sleep -Seconds 5
-
-# 1. BrokerInitializer (콘솔 앱이라 완료를 기다려야 하므로 Start-Process가 아니라 동기 실행)
-Write-Host "=== [1/10] BrokerInitializer 실행 ===" -ForegroundColor Cyan
-if ($Build) {
-    Push-Location "$devTools\BrokerInitializer"
-    dotnet run
-    $exitCode = $LASTEXITCODE
-    Pop-Location
-} else {
-    $brokerDll = "$devTools\BrokerInitializer\bin\$Configuration\net8.0\BrokerInitializer.dll"
-    if (-not (Test-Path $brokerDll)) {
-        Write-Host "빌드된 DLL을 못 찾음: $brokerDll" -ForegroundColor Red
-        Write-Host "먼저 빌드하거나(dotnet build), .\start-servers.ps1 -Build 로 실행하세요." -ForegroundColor Red
-        exit 1
-    }
-    Push-Location "$devTools\BrokerInitializer"
-    dotnet $brokerDll
-    $exitCode = $LASTEXITCODE
-    Pop-Location
-}
-
-if ($exitCode -ne 0) {
-    Write-Host "BrokerInitializer 실패. 중단합니다." -ForegroundColor Red
-    exit 1
-}
-
 $serverPids = @{}
 
-# 2. MasterServer
-Write-Host "=== [2/10] MasterServer 실행 ===" -ForegroundColor Cyan
-$p = Start-ServerProcess -ProjectPath "$gameServer\MasterServer" -ProjectName "MasterServer"
-$serverPids["MasterServer"] = $p.Id
-Start-Sleep -Seconds 3
+foreach ($name in $targets) {
+    $step = [array]::IndexOf($ServerOrder, $name) + 2
+    Write-Host "=== [$step/$totalSteps] $name 실행 ===" -ForegroundColor Cyan
 
-# 3. MatchingServer (마스터 서버 직후 실행 - 마스터가 주소를 메인 서버들에 전달)
-Write-Host "=== [3/10] MatchingServer 실행 ===" -ForegroundColor Cyan
-$p = Start-ServerProcess -ProjectPath "$gameServer\MatchingServer" -ProjectName "MatchingServer"
-$serverPids["MatchingServer"] = $p.Id
-Start-Sleep -Seconds 3
+    $projectPath = "$gameServer\$name"
 
-# 4. AccountServer (로그인 서버가 계정 검증/생성에 씀 - 로그인 서버보다 먼저 떠 있어야 함)
-Write-Host "=== [4/10] AccountServer 실행 ===" -ForegroundColor Cyan
-$p = Start-ServerProcess -ProjectPath "$gameServer\AccountServer" -ProjectName "AccountServer"
-$serverPids["AccountServer"] = $p.Id
-Start-Sleep -Seconds 3
+    if ($harness) {
+        $result = Start-HarnessServer -ProjectPath $projectPath -ProjectName $name -LogDir $LogDir `
+            -Configuration $Configuration -ReadyTimeoutSeconds $ReadyTimeoutSeconds `
+            -HarnessAddress $HarnessAddress -Build:$Build
+        $process = $result.Process
+        $ok = $result.Status -eq "ready"
+    }
+    else {
+        $process = Start-WindowedServer -ProjectPath $projectPath -ProjectName $name
+        $ok = $null -ne $process
+    }
 
-# 5. LoginServer (클라 최초 진입점 - AccountServer/MatchingServer 주소가 필요하므로 그 뒤에 실행)
-Write-Host "=== [5/10] LoginServer 실행 ===" -ForegroundColor Cyan
-$p = Start-ServerProcess -ProjectPath "$gameServer\LoginServer" -ProjectName "LoginServer"
-$serverPids["LoginServer"] = $p.Id
-Start-Sleep -Seconds 3
+    # 하나 띄울 때마다 바로 저장 - 중간에 실패해도 이미 뜬 서버는 stop-servers.ps1로 정리된다.
+    if ($null -ne $process) {
+        $serverPids[$name] = $process.Id
+        Save-PidFile -Map $serverPids -Path $pidFile
+    }
 
-# 6. DummySubServer
-Write-Host "=== [6/10] DummySubServer 실행 ===" -ForegroundColor Cyan
-$p = Start-ServerProcess -ProjectPath "$gameServer\DummySubServer" -ProjectName "DummySubServer"
-$serverPids["DummySubServer"] = $p.Id
-Start-Sleep -Seconds 3
+    if (-not $ok) {
+        $stopCommand = if ($harness) { ".\stop-servers.ps1 -LogDir `"$LogDir`"" } else { ".\stop-servers.ps1" }
+        Write-Host ""
+        Write-Host "$name 시작 실패. 중단합니다. 이미 뜬 서버 정리: $stopCommand" -ForegroundColor Red
+        exit 1
+    }
 
-# 7. LobbyServer
-Write-Host "=== [7/10] LobbyServer 실행 ===" -ForegroundColor Cyan
-$p = Start-ServerProcess -ProjectPath "$gameServer\LobbyServer" -ProjectName "LobbyServer"
-$serverPids["LobbyServer"] = $p.Id
-Start-Sleep -Seconds 3
+    # 수동 모드는 준비 여부를 알 방법이 없어 예전처럼 고정 대기.
+    if (-not $harness) { Start-Sleep -Seconds 3 }
+}
 
-# 8. GameAgent
-Write-Host "=== [8/10] GameAgent 실행 ===" -ForegroundColor Cyan
-$p = Start-ServerProcess -ProjectPath "$gameServer\GameAgent" -ProjectName "GameAgent"
-$serverPids["GameAgent"] = $p.Id
-Start-Sleep -Seconds 3
-
-# 9. ChatServer
-Write-Host "=== [9/10] ChatServer 실행 ===" -ForegroundColor Cyan
-$p = Start-ServerProcess -ProjectPath "$gameServer\ChatServer" -ProjectName "ChatServer"
-$serverPids["ChatServer"] = $p.Id
-Start-Sleep -Seconds 3
-
-$serverPids | ConvertTo-Json | Set-Content $pidFile
 Write-Host ""
 Write-Host "=== 모든 서버 실행 완료 ===" -ForegroundColor Green
 Write-Host "PID 파일 저장됨: $pidFile" -ForegroundColor Gray
-Write-Host ""
-Write-Host "이제 Unity 에디터에서 Play 버튼을 눌러주세요." -ForegroundColor Yellow
-Write-Host "종료하려면: .\stop-servers.ps1" -ForegroundColor Yellow
+
+if ($harness) {
+    Write-Host "로그 폴더: $LogDir" -ForegroundColor Gray
+    Write-Host "종료하려면: .\stop-servers.ps1 -LogDir `"$LogDir`"" -ForegroundColor Yellow
+}
+else {
+    Write-Host ""
+    Write-Host "이제 Unity 에디터에서 Play 버튼을 눌러주세요." -ForegroundColor Yellow
+    Write-Host "종료하려면: .\stop-servers.ps1" -ForegroundColor Yellow
+}
+
+exit 0

@@ -8,6 +8,12 @@
 # server-pids.json을 start-servers.ps1/stop-servers.ps1과 그대로 공유하므로, 이 스크립트로
 # 죽이거나 새로 띄운 것도 stop-servers.ps1이 정상적으로 인식한다.
 # 항상 이미 빌드된 DLL을 실행한다(-Build 옵션 없음) - 필요하면 먼저 dotnet build.
+#
+# 하네스 모드: -LogDir <start-servers.ps1에 준 폴더> [-ReadyTimeoutSeconds 60]
+#   그 폴더의 PID 파일을 쓰고, 새로 띄운 서버는 창 없이 같은 폴더에 로그를 남긴다.
+#   재시작하면 이전 로그를 덮어쓰지 않고 <서버>.2.log, <서버>.3.log ... 로 이어서 남긴다.
+#   Start/Restart는 서버가 준비될 때까지 기다리고, 실패하면 exit 1.
+#   -HarnessAddress <주소>를 주면 새로 띄운 서버도 테스트 하네스에 접속한다(start-servers.ps1과 같은 값).
 
 param(
     [Parameter(Mandatory)]
@@ -19,29 +25,23 @@ param(
     [ValidateSet("Kill", "Restart", "Start")]
     [string]$Action,
 
-    [string]$Configuration = "Debug"
+    [string]$Configuration = "Debug",
+
+    [string]$LogDir,
+    [int]$ReadyTimeoutSeconds = 60,
+    [string]$HarnessAddress
 )
+
+. "$PSScriptRoot\server-common.ps1"
 
 $devTools = $PSScriptRoot
 $root = Split-Path $devTools -Parent
 $gameServer = "$root\Server\GameServer"
-$pidFile = "$devTools\server-pids.json"
+$harness = [bool]$LogDir
+if ($harness) { $LogDir = Resolve-LogDir $LogDir }
+$pidFile = Get-PidFilePath -DevTools $devTools -LogDir $LogDir
 
-function Get-SavedPids {
-    if (Test-Path $pidFile) {
-        $obj = Get-Content $pidFile | ConvertFrom-Json
-        $map = @{}
-        foreach ($entry in $obj.PSObject.Properties) { $map[$entry.Name] = $entry.Value }
-        return $map
-    }
-    return @{}
-}
-
-function Save-Pids($map) {
-    $map | ConvertTo-Json | Set-Content $pidFile
-}
-
-$serverPids = Get-SavedPids
+$serverPids = Read-PidFile $pidFile
 
 function Stop-Target {
     if (-not $serverPids.ContainsKey($ServerName)) {
@@ -49,23 +49,26 @@ function Stop-Target {
         return
     }
 
-    $targetPid = $serverPids[$ServerName]
-    $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
-    if ($null -eq $proc) {
-        Write-Host "$ServerName 이미 종료됨 (PID=$targetPid)" -ForegroundColor Gray
-    } else {
-        Write-Host "$ServerName 종료 중 (PID=$targetPid)..." -ForegroundColor Cyan
-        taskkill /PID $targetPid /T /F | Out-Null
-        Wait-Process -Id $targetPid -Timeout 10 -ErrorAction SilentlyContinue
-        Write-Host "$ServerName 종료 완료" -ForegroundColor Green
-    }
+    Stop-ServerProcess -Name $ServerName -ProcessId $serverPids[$ServerName]
 
     $serverPids.Remove($ServerName)
-    Save-Pids $serverPids
+    Save-PidFile -Map $serverPids -Path $pidFile
 }
 
 function Start-Target {
     $projectPath = "$gameServer\$ServerName"
+
+    if ($harness) {
+        $result = Start-HarnessServer -ProjectPath $projectPath -ProjectName $ServerName -LogDir $LogDir `
+            -Configuration $Configuration -ReadyTimeoutSeconds $ReadyTimeoutSeconds -HarnessAddress $HarnessAddress
+        if ($null -ne $result.Process) {
+            $serverPids[$ServerName] = $result.Process.Id
+            Save-PidFile -Map $serverPids -Path $pidFile
+        }
+        if ($result.Status -ne "ready") { exit 1 }
+        return
+    }
+
     $dll = "$projectPath\bin\$Configuration\net8.0\$ServerName.dll"
     if (-not (Test-Path $dll)) {
         Write-Host "빌드된 DLL을 못 찾음: $dll - 먼저 빌드하세요." -ForegroundColor Red
@@ -75,7 +78,7 @@ function Start-Target {
     $titleCommand = "`$host.UI.RawUI.WindowTitle = '$ServerName'"
     $p = Start-Process powershell -ArgumentList "-NoExit", "-Command", "$titleCommand; cd '$projectPath'; dotnet '$dll'" -PassThru
     $serverPids[$ServerName] = $p.Id
-    Save-Pids $serverPids
+    Save-PidFile -Map $serverPids -Path $pidFile
     Write-Host "$ServerName 시작됨 (PID=$($p.Id))" -ForegroundColor Green
 }
 
@@ -84,3 +87,5 @@ switch ($Action) {
     "Start"   { Start-Target }
     "Restart" { Stop-Target; Start-Sleep -Seconds 1; Start-Target }
 }
+
+exit 0

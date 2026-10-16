@@ -114,6 +114,31 @@ public sealed class BrokerInitializer
         }
     }
 
+    // 컨테이너를 막 띄운 직후엔 포트는 열려 있어도 RabbitMQ가 아직 부팅 중이라 핸드셰이크에서
+    // 연결이 끊긴다(BrokerUnreachableException). start-servers.ps1의 고정 대기(5초)로는 모자랄 때가
+    // 있어서, 준비될 때까지 1초 간격으로 다시 시도한다.
+    private static readonly TimeSpan RabbitMqReadyTimeout = TimeSpan.FromSeconds(60);
+
+    private static IConnection ConnectRabbitMqWithRetry(ConnectionFactory factory)
+    {
+        var deadline = DateTime.UtcNow + RabbitMqReadyTimeout;
+        var attempt = 0;
+
+        while (true)
+        {
+            attempt++;
+            try
+            {
+                return factory.CreateConnection();
+            }
+            catch (RabbitMQ.Client.Exceptions.BrokerUnreachableException) when (DateTime.UtcNow < deadline)
+            {
+                Console.WriteLine($"[RabbitMQ] 아직 준비 안 됨 - 1초 뒤 재시도 ({attempt}회째)");
+                Thread.Sleep(TimeSpan.FromSeconds(1));
+            }
+        }
+    }
+
     private static void InitRabbitMq(RabbitMqConfig config)
     {
         Console.WriteLine($"[RabbitMQ] {config.Host}:{config.Port} 연결 중...");
@@ -127,7 +152,7 @@ public sealed class BrokerInitializer
             VirtualHost = config.VirtualHost,
         };
 
-        using var connection = factory.CreateConnection();
+        using var connection = ConnectRabbitMqWithRetry(factory);
         using var channel = connection.CreateModel();
 
         foreach (var fanout in config.Fanouts)
