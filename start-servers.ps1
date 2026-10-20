@@ -17,6 +17,7 @@
 #   -Only        지정한 서버만 띄운다(순서는 항상 위 순서를 따름). 수동 모드에서도 쓸 수 있다.
 #   -HarnessAddress <주소>  각 서버가 테스트 하네스 제어 서버(예: http://localhost:9000)에 접속하게 한다
 #                (서버 이름이 하네스에서 부르는 이름이 됨). -LogDir과 같이 써야 한다.
+#   결과 파일: <폴더>\start-result.json - 단계별 ready/failed/skipped (server-common.ps1 "하네스 결과 파일")
 #   종료: .\stop-servers.ps1 -LogDir <같은 폴더>
 # 성공하면 exit 0, 실패하면 exit 1.
 
@@ -44,21 +45,35 @@ if ($HarnessAddress -and -not $harness) {
     exit 1
 }
 
+if ($harness) {
+    $LogDir = Resolve-LogDir $LogDir
+    # dotnet run은 빌드 시간까지 포함되므로 제한 시간을 따로 안 줬으면 넉넉히.
+    if ($Build -and -not $PSBoundParameters.ContainsKey("ReadyTimeoutSeconds")) { $ReadyTimeoutSeconds = 300 }
+
+    # 이전 실행의 결과 파일이 남아 있으면 하네스가 그걸 이번 결과로 착각할 수 있으니 먼저 지운다.
+    $resultFile = Join-Path $LogDir "start-result.json"
+    if (Test-Path $resultFile) { Remove-Item $resultFile }
+}
+
+# 끝낼 때는 항상 이걸로 - 하네스 모드면 결과 파일을 쓰고 나간다.
+function Exit-Start {
+    param([int]$Code)
+
+    if ($harness) { Save-HarnessResult -Path $resultFile -Ok ($Code -eq 0) -Action "start" }
+    exit $Code
+}
+
 if ($Only) {
     $Only = @($Only | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $unknown = @($Only | Where-Object { $ServerOrder -notcontains $_ })
     if ($unknown.Count -gt 0) {
         Write-Host "-Only에 모르는 서버 이름: $($unknown -join ', ')" -ForegroundColor Red
         Write-Host "가능한 이름: $($ServerOrder -join ', ')" -ForegroundColor Red
-        exit 1
+        foreach ($name in $unknown) { Add-HarnessResult -Name $name -Status "failed" -Detail "unknown-server" }
+        Exit-Start 1
     }
 }
 
-if ($harness) {
-    $LogDir = Resolve-LogDir $LogDir
-    # dotnet run은 빌드 시간까지 포함되므로 제한 시간을 따로 안 줬으면 넉넉히.
-    if ($Build -and -not $PSBoundParameters.ContainsKey("ReadyTimeoutSeconds")) { $ReadyTimeoutSeconds = 300 }
-}
 $pidFile = Get-PidFilePath -DevTools $devTools -LogDir $LogDir
 
 # 이미 떠 있는 서버가 있으면 중단 - 이번에 쓸 PID 파일과, (하네스 모드라면) 수동 모드 PID
@@ -76,6 +91,7 @@ foreach ($file in $pidFilesToCheck) {
         $savedPid = $savedPids[$name]
         if (Get-Process -Id $savedPid -ErrorAction SilentlyContinue) {
             Write-Host "서버가 아직 실행 중입니다: $name (PID=$savedPid, $file)" -ForegroundColor Red
+            Add-HarnessResult -Name $name -Status "failed" -ProcessId $savedPid -Detail "already-running"
             $fileAlive++
         }
     }
@@ -87,7 +103,7 @@ foreach ($file in $pidFilesToCheck) {
 if ($aliveCount -gt 0) {
     Write-Host ""
     Write-Host "실행 중인 서버가 있습니다. stop-servers.ps1을 먼저 실행하세요." -ForegroundColor Red
-    exit 1
+    Exit-Start 1
 }
 
 # 이번에 띄울 서버 - 순서는 항상 $ServerOrder를 따른다.
@@ -97,6 +113,8 @@ $totalSteps = $ServerOrder.Count + 2   # Docker + BrokerInitializer + 서버들
 
 if ($SkipDocker) {
     Write-Host "=== [0-1/$totalSteps] Docker / BrokerInitializer 건너뜀 (-SkipDocker) ===" -ForegroundColor DarkGray
+    Add-HarnessResult -Name "Docker" -Status "skipped" -Detail "skip-docker"
+    Add-HarnessResult -Name "BrokerInitializer" -Status "skipped" -Detail "skip-docker"
 }
 else {
     # 0. Docker 컨테이너 시작
@@ -104,8 +122,10 @@ else {
     docker-compose -f "$devTools\docker-compose.yml" up -d
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Docker 시작 실패. 중단합니다." -ForegroundColor Red
-        exit 1
+        Add-HarnessResult -Name "Docker" -Status "failed" -Detail "docker-compose-exit=$LASTEXITCODE"
+        Exit-Start 1
     }
+    Add-HarnessResult -Name "Docker" -Status "ready"
     Start-Sleep -Seconds 5
 
     # 1. BrokerInitializer (콘솔 앱이라 완료를 기다려야 하므로 동기 실행)
@@ -116,14 +136,19 @@ else {
     if (-not $Build -and -not (Test-Path $brokerDll)) {
         Write-Host "빌드된 DLL을 못 찾음: $brokerDll" -ForegroundColor Red
         Write-Host "먼저 빌드하거나(dotnet build), .\start-servers.ps1 -Build 로 실행하세요." -ForegroundColor Red
-        exit 1
+        Add-HarnessResult -Name "BrokerInitializer" -Status "failed" -Detail "missing-dll"
+        Exit-Start 1
     }
 
+    $brokerLog = ""
+    $brokerErr = ""
     if ($harness) {
         $brokerArgs = if ($Build) { @("run") } else { @("`"$brokerDll`"") }
         $broker = Start-HarnessProcess -Name "BrokerInitializer" -WorkingDirectory $brokerDir `
             -DotnetArguments $brokerArgs -LogDir $LogDir -Wait
         $exitCode = $broker.Process.ExitCode
+        $brokerLog = $broker.LogPath
+        $brokerErr = $broker.ErrPath
         if ($exitCode -ne 0) {
             Write-LogTail $broker.LogPath
             Write-LogHead $broker.ErrPath
@@ -138,8 +163,10 @@ else {
 
     if ($exitCode -ne 0) {
         Write-Host "BrokerInitializer 실패. 중단합니다." -ForegroundColor Red
-        exit 1
+        Add-HarnessResult -Name "BrokerInitializer" -Status "failed" -Detail "exit=$exitCode" -LogPath $brokerLog -ErrPath $brokerErr
+        Exit-Start 1
     }
+    Add-HarnessResult -Name "BrokerInitializer" -Status "ready" -LogPath $brokerLog -ErrPath $brokerErr
 }
 
 # 수동 모드: 예전과 같이 서버마다 새 PowerShell 창을 띄운다.
@@ -182,6 +209,17 @@ foreach ($name in $targets) {
             -HarnessAddress $HarnessAddress -Build:$Build
         $process = $result.Process
         $ok = $result.Status -eq "ready"
+
+        $processId = if ($null -ne $process) { $process.Id } else { 0 }
+        if ($ok) {
+            Add-HarnessResult -Name $name -Status "ready" -ProcessId $processId -LogPath $result.LogPath -ErrPath $result.ErrPath
+        }
+        else {
+            # Status: exited(뜨다가 죽음) | timeout | missing(빌드된 DLL 없음)
+            $detail = if ($result.Status -eq "missing") { "missing-dll" } else { $result.Status }
+            Add-HarnessResult -Name $name -Status "failed" -ProcessId $processId -Detail $detail `
+                -LogPath $result.LogPath -ErrPath $result.ErrPath
+        }
     }
     else {
         $process = Start-WindowedServer -ProjectPath $projectPath -ProjectName $name
@@ -198,7 +236,13 @@ foreach ($name in $targets) {
         $stopCommand = if ($harness) { ".\stop-servers.ps1 -LogDir `"$LogDir`"" } else { ".\stop-servers.ps1" }
         Write-Host ""
         Write-Host "$name 시작 실패. 중단합니다. 이미 뜬 서버 정리: $stopCommand" -ForegroundColor Red
-        exit 1
+
+        # 실패 지점 뒤로 못 띄운 서버들도 결과에 남긴다 - 하네스가 "어디서 멈췄는지" 바로 알 수 있게.
+        $index = [array]::IndexOf(@($targets), $name)
+        foreach ($rest in @($targets) | Select-Object -Skip ($index + 1)) {
+            Add-HarnessResult -Name $rest -Status "skipped" -Detail "aborted"
+        }
+        Exit-Start 1
     }
 
     # 수동 모드는 준비 여부를 알 방법이 없어 예전처럼 고정 대기.
@@ -219,4 +263,4 @@ else {
     Write-Host "종료하려면: .\stop-servers.ps1" -ForegroundColor Yellow
 }
 
-exit 0
+Exit-Start 0

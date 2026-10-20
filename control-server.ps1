@@ -14,6 +14,8 @@
 #   재시작하면 이전 로그를 덮어쓰지 않고 <서버>.2.log, <서버>.3.log ... 로 이어서 남긴다.
 #   Start/Restart는 서버가 준비될 때까지 기다리고, 실패하면 exit 1.
 #   -HarnessAddress <주소>를 주면 새로 띄운 서버도 테스트 하네스에 접속한다(start-servers.ps1과 같은 값).
+#   결과 파일: <폴더>\control-result.json - Kill은 killed/not-running, Start는 ready/failed
+#   (Restart는 두 줄). 형식은 server-common.ps1 "하네스 결과 파일".
 
 param(
     [Parameter(Mandatory)]
@@ -38,18 +40,39 @@ $devTools = $PSScriptRoot
 $root = Split-Path $devTools -Parent
 $gameServer = "$root\Server\GameServer"
 $harness = [bool]$LogDir
-if ($harness) { $LogDir = Resolve-LogDir $LogDir }
+if ($harness) {
+    $LogDir = Resolve-LogDir $LogDir
+    $resultFile = Join-Path $LogDir "control-result.json"
+    if (Test-Path $resultFile) { Remove-Item $resultFile }
+}
 $pidFile = Get-PidFilePath -DevTools $devTools -LogDir $LogDir
+
+# 끝낼 때는 항상 이걸로 - 하네스 모드면 결과 파일을 쓰고 나간다.
+function Exit-Control {
+    param([int]$Code)
+
+    if ($harness) { Save-HarnessResult -Path $resultFile -Ok ($Code -eq 0) -Action $Action.ToLowerInvariant() }
+    exit $Code
+}
 
 $serverPids = Read-PidFile $pidFile
 
 function Stop-Target {
     if (-not $serverPids.ContainsKey($ServerName)) {
         Write-Host "$ServerName 은 PID 파일에 없습니다(안 떠 있거나 start-servers.ps1로 안 띄움)." -ForegroundColor Yellow
+        Add-HarnessResult -Name $ServerName -Status "not-running" -Detail "not-in-pid-file"
         return
     }
 
-    Stop-ServerProcess -Name $ServerName -ProcessId $serverPids[$ServerName]
+    $targetPid = [int]$serverPids[$ServerName]
+    $wasAlive = $null -ne (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)
+    Stop-ServerProcess -Name $ServerName -ProcessId $targetPid
+    if ($wasAlive) {
+        Add-HarnessResult -Name $ServerName -Status "killed" -ProcessId $targetPid
+    }
+    else {
+        Add-HarnessResult -Name $ServerName -Status "not-running" -ProcessId $targetPid -Detail "already-exited"
+    }
 
     $serverPids.Remove($ServerName)
     Save-PidFile -Map $serverPids -Path $pidFile
@@ -61,11 +84,20 @@ function Start-Target {
     if ($harness) {
         $result = Start-HarnessServer -ProjectPath $projectPath -ProjectName $ServerName -LogDir $LogDir `
             -Configuration $Configuration -ReadyTimeoutSeconds $ReadyTimeoutSeconds -HarnessAddress $HarnessAddress
+        $processId = 0
         if ($null -ne $result.Process) {
-            $serverPids[$ServerName] = $result.Process.Id
+            $processId = $result.Process.Id
+            $serverPids[$ServerName] = $processId
             Save-PidFile -Map $serverPids -Path $pidFile
         }
-        if ($result.Status -ne "ready") { exit 1 }
+        if ($result.Status -ne "ready") {
+            $detail = if ($result.Status -eq "missing") { "missing-dll" } else { $result.Status }
+            Add-HarnessResult -Name $ServerName -Status "failed" -ProcessId $processId -Detail $detail `
+                -LogPath $result.LogPath -ErrPath $result.ErrPath
+            Exit-Control 1
+        }
+        Add-HarnessResult -Name $ServerName -Status "ready" -ProcessId $processId `
+            -LogPath $result.LogPath -ErrPath $result.ErrPath
         return
     }
 
@@ -88,4 +120,4 @@ switch ($Action) {
     "Restart" { Stop-Target; Start-Sleep -Seconds 1; Start-Target }
 }
 
-exit 0
+Exit-Control 0

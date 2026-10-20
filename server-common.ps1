@@ -8,6 +8,8 @@
 #   - 고정 대기(Start-Sleep) 대신 로그에 "Application started"가 찍힐 때까지 기다린다.
 #   - PID 파일을 DevTools가 아니라 LogDir 안에 둔다 - 손으로 띄운 서버(수동 모드)와 섞이지 않게.
 #   - -HarnessAddress를 주면 서버에 HARNESS_ADDRESS/HARNESS_NAME을 넣어 테스트 하네스에 접속하게 한다.
+#   - 끝날 때 결과를 LogDir 안의 JSON 파일(start-result.json / control-result.json)로 남긴다 - 하네스는
+#     콘솔 문구가 아니라 이 파일로 성공/실패를 판단한다(아래 "하네스 결과 파일").
 # -LogDir 없이 실행하면(수동 모드) 예전과 똑같이 동작한다.
 
 # 실행 순서(종료는 역순). start-servers.ps1의 단계 번호도 이 순서를 따른다.
@@ -33,6 +35,58 @@ $HarnessLoggingEnvironment = [ordered]@{
 
 # 서버가 다 떴다는 표시 - ASP.NET Core 호스트가 모든 시작 작업을 끝낸 뒤 찍는 줄.
 $ReadyMarker = "Application started"
+
+# ---------------------------------------------------------------------------------------------
+# 하네스 결과 파일
+#
+# 하네스(TestHarness/HarnessDaemon)가 이 스크립트들을 부른 뒤 읽는 기계용 결과. 사람용 콘솔 문구는
+# 그대로 두고, 같은 내용을 단계(Docker, BrokerInitializer, 서버)마다 한 줄씩 모았다가 끝날 때 쓴다.
+#   { "ok": false, "action": "start", "finishedUtc": "...",
+#     "results": [ { "name": "LoginServer", "status": "ready", "pid": 1234, "detail": "",
+#                    "log": "...\LoginServer.log", "errLog": "...\LoginServer.err.log" }, ... ] }
+# status: ready(떴음/끝남) | failed | skipped(건너뜀) | killed | not-running
+# detail은 영문 짧은 코드(exited, timeout, missing-dll, already-running, aborted ...) - Windows
+# PowerShell 5.1이 이 스크립트를 ANSI로 읽기 때문에, 한글을 넣으면 하네스 쪽에서 깨져 보인다.
+# 파일은 UTF-8(BOM 없음)로 쓴다 - Set-Content는 5.1에서 ANSI로 써서 쓰지 않는다.
+# ---------------------------------------------------------------------------------------------
+$script:HarnessResults = New-Object System.Collections.ArrayList
+
+function Add-HarnessResult {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Status,
+        [int]$ProcessId = 0,
+        [string]$Detail = "",
+        [string]$LogPath = "",
+        [string]$ErrPath = ""
+    )
+
+    [void]$script:HarnessResults.Add([ordered]@{
+        name   = $Name
+        status = $Status
+        pid    = $ProcessId
+        detail = $Detail
+        log    = $LogPath
+        errLog = $ErrPath
+    })
+}
+
+function Save-HarnessResult {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][bool]$Ok,
+        [Parameter(Mandatory)][string]$Action
+    )
+
+    $document = [ordered]@{
+        ok          = $Ok
+        action      = $Action
+        finishedUtc = (Get-Date).ToUniversalTime().ToString("o")
+        results     = @($script:HarnessResults)
+    }
+    $json = ConvertTo-Json -InputObject $document -Depth 5
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
 
 function Get-PidFilePath {
     param([string]$DevTools, [string]$LogDir)
@@ -194,7 +248,7 @@ function Write-LogHead {
 }
 
 # 하네스 모드로 서버 하나를 띄우고 준비될 때까지 기다린다. 실패하면 로그 끝부분을 찍는다.
-# 반환: @{ Process = ...; Status = "ready"|"exited"|"timeout" }
+# 반환: @{ Process = ...; Status = "ready"|"exited"|"timeout"|"missing"; LogPath = ...; ErrPath = ... }
 function Start-HarnessServer {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
@@ -222,7 +276,7 @@ function Start-HarnessServer {
         if (-not (Test-Path $dll)) {
             Write-Host "빌드된 DLL을 못 찾음: $dll" -ForegroundColor Red
             Write-Host "먼저 빌드하거나(dotnet build), -Build 를 붙여 실행하세요." -ForegroundColor Red
-            return @{ Process = $null; Status = "missing" }
+            return @{ Process = $null; Status = "missing"; LogPath = ""; ErrPath = "" }
         }
         $dotnetArgs = @("`"$dll`"")
     }
@@ -244,7 +298,7 @@ function Start-HarnessServer {
         Write-LogHead $started.ErrPath
     }
 
-    return @{ Process = $started.Process; Status = $status }
+    return @{ Process = $started.Process; Status = $status; LogPath = $started.LogPath; ErrPath = $started.ErrPath }
 }
 
 # 프로세스(와 그 자식들)를 강제 종료한다. 수동 모드에선 PID가 PowerShell 창이라 /T로
