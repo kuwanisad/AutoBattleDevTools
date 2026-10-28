@@ -247,8 +247,40 @@ function Write-LogHead {
     $text.TrimEnd() -split "`r?`n" | Select-Object -First $Lines | ForEach-Object { Write-Host $_ }
 }
 
+# 하네스 DLL 폴더 - Server/GameServer/Shared/Test/bin/<구성>/net8.0 (Shared/Test/Directory.Build.props와 맞춤).
+function Get-HarnessOutputDir {
+    param([Parameter(Mandatory)][string]$ProjectPath, [Parameter(Mandatory)][string]$Configuration)
+
+    $gameServer = Split-Path $ProjectPath -Parent
+    return Join-Path $gameServer "Shared\Test\bin\$Configuration\net8.0"
+}
+
+# -Build(dotnet run)일 때 하네스 쪽도 빌드한다 - 서버가 하네스를 참조하지 않으니 dotnet run이 같이 빌드해 주지 않는다.
+# 서버별 명령 프로젝트(Shared/Test/<서버>.Harness)가 있으면 그걸(Harness.Agent도 같이 빌드됨), 없으면 Harness.Agent만.
+function Build-HarnessProject {
+    param(
+        [Parameter(Mandatory)][string]$ProjectPath,
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$Configuration,
+        [Parameter(Mandatory)][string]$LogDir
+    )
+
+    $sharedTest = Join-Path (Split-Path $ProjectPath -Parent) "Shared\Test"
+    $project = Join-Path $sharedTest "$ProjectName.Harness\$ProjectName.Harness.csproj"
+    if (-not (Test-Path $project)) { $project = Join-Path $sharedTest "Harness.Agent\Harness.Agent.csproj" }
+
+    $base = Get-FreeLogBaseName -LogDir $LogDir -Name "$ProjectName.harness-build"
+    $output = Join-Path $LogDir "$base.log"
+    dotnet build "$project" --configuration $Configuration -nologo -v q *> $output
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "하네스 빌드 실패 ($project) - $output" -ForegroundColor Red
+        Write-LogTail $output
+    }
+}
+
 # 하네스 모드로 서버 하나를 띄우고 준비될 때까지 기다린다. 실패하면 로그 끝부분을 찍는다.
-# 반환: @{ Process = ...; Status = "ready"|"exited"|"timeout"|"missing"; LogPath = ...; ErrPath = ... }
+# 반환: @{ Process = ...; Status = "ready"|"exited"|"timeout"|"missing"|"missing-harness"; LogPath = ...; ErrPath = ... }
+# (missing-harness: -HarnessAddress를 줬는데 하네스 에이전트 DLL이 없음 - 결과 파일 detail에 그대로 실린다)
 function Start-HarnessServer {
     param(
         [Parameter(Mandatory)][string]$ProjectPath,
@@ -265,6 +297,20 @@ function Start-HarnessServer {
     if ($HarnessAddress) {
         $extraEnvironment["HARNESS_ADDRESS"] = $HarnessAddress
         $extraEnvironment["HARNESS_NAME"] = $ProjectName
+
+        # 서버 프로젝트는 하네스를 참조하지 않는다 - 여기서 환경 변수로 주입한다(Harness.Agent.csproj 주석).
+        #   DOTNET_STARTUP_HOOKS: .NET이 Main 전에 부름 - 하네스 폴더에서 어셈블리를 찾게 함
+        #   ASPNETCORE_HOSTINGSTARTUPASSEMBLIES: ASP.NET Core가 CreateBuilder 안에서 부름 - 에이전트 등록
+        $harnessDir = Get-HarnessOutputDir -ProjectPath $ProjectPath -Configuration $Configuration
+        $harnessDll = Join-Path $harnessDir "Harness.Agent.dll"
+        if ($Build) { Build-HarnessProject -ProjectPath $ProjectPath -ProjectName $ProjectName -Configuration $Configuration -LogDir $LogDir }
+        if (-not (Test-Path $harnessDll)) {
+            Write-Host "하네스 에이전트 DLL을 못 찾음: $harnessDll" -ForegroundColor Red
+            Write-Host "먼저 빌드하세요(dotnet build Server\GameServer\Shared\Test\Harness.Agent, 서버별 명령이 있으면 Shared\Test\<서버>.Harness)." -ForegroundColor Red
+            return @{ Process = $null; Status = "missing-harness"; LogPath = ""; ErrPath = "" }
+        }
+        $extraEnvironment["DOTNET_STARTUP_HOOKS"] = $harnessDll
+        $extraEnvironment["ASPNETCORE_HOSTINGSTARTUPASSEMBLIES"] = "Harness.Agent"
     }
 
     if ($Build) {
